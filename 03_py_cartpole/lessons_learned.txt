@@ -1,0 +1,5 @@
+Lessons learned from simple cartpole (input - provided observations, 4 numbers - coordinates and velocities)
+1. value-prediction and choosing best value is unstable. It tends to short-circuit itself by always predicting the same move, quickly falling, thus minimazing the loss by always correctly predicting quick fall.
+2. Relu on final layer seems to increase the chance of short-circuit
+3. Exploration is important! It allows the agent to learn something from "random" policy while he is still weak himself
+4. History helps prevent short-circuit as well, by remembering good examples. 
