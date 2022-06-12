@@ -1,13 +1,4 @@
 //! Wrappers around the Python API of the OpenAI gym.
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
-}
-
 use cpython::{NoArgs, ObjectProtocol, PyObject, PyResult, Python, ToPyObject};
 use tch::Tensor;
 
@@ -44,9 +35,14 @@ impl GymEnv {
     pub fn new(name: &str) -> PyResult<GymEnv> {
         let gil = Python::acquire_gil();
         let py = gil.python();
+        let sys = py.import("sys").unwrap();
+        let version: String = sys.get(py, "version")?.extract(py)?;
+        println!("Python version: {}", version);
         let gym = py.import("gym")?;
+        let gym_version : String = gym.get(py, "__version__")?.extract(py)?;
+        println!("Gym version: {}", gym_version);
         let env = gym.call(py, "make", (name,), None)?;
-        let _ = env.call_method(py, "seed", (42,), None)?;
+        //let _ = env.call_method(py, "seed", (42,), None)?;
         let action_space = env.getattr(py, "action_space")?;
         let action_space = if let Ok(val) = action_space.getattr(py, "n") {
             val.extract(py)?
