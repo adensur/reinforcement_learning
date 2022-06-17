@@ -432,6 +432,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "s02_cardpole_hard"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "gym",
+ "rand",
+ "structopt",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"

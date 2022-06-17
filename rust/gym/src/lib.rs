@@ -1,5 +1,5 @@
 //! Wrappers around the Python API of the OpenAI gym.
-use cpython::{NoArgs, ObjectProtocol, PyObject, PyResult, Python, ToPyObject};
+use cpython::{NoArgs, ObjectProtocol, PyDict, PyObject, PyResult, Python, ToPyObject};
 use tch::Tensor;
 
 /// The return value for a step.
@@ -39,7 +39,7 @@ impl GymEnv {
         let version: String = sys.get(py, "version")?.extract(py)?;
         println!("Python version: {}", version);
         let gym = py.import("gym")?;
-        let gym_version : String = gym.get(py, "__version__")?.extract(py)?;
+        let gym_version: String = gym.get(py, "__version__")?.extract(py)?;
         println!("Gym version: {}", gym_version);
         let env = gym.call(py, "make", (name,), None)?;
         //let _ = env.call_method(py, "seed", (42,), None)?;
@@ -78,6 +78,36 @@ impl GymEnv {
             is_done: step.get_item(py, 2)?.extract(py)?,
             action,
         })
+    }
+
+    pub fn render(&self) -> PyResult<Tensor> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let args = PyDict::new(py);
+        args.set_item(py, "mode", "rgb_array")?;
+        let img = self
+            .env
+            .call_method(py, "render", NoArgs, Some(&args))
+            .unwrap();
+        let flat_img = img
+            .call_method(py, "flatten", NoArgs, None)
+            .unwrap()
+            .extract::<Vec<f32>>(py)
+            .unwrap();
+        let shape_vec = img
+            .getattr(py, "shape")
+            .unwrap()
+            .extract::<Vec<i64>>(py)
+            .unwrap();
+        let mut shape = [0, 0, 0];
+        if shape_vec.len() != shape.len() {
+            panic!("");
+        }
+        for i in 0..shape.len() {
+            shape[i] = shape_vec[i];
+        }
+        let t = Tensor::of_slice(&flat_img).view(shape).permute(&[2, 0, 1]);
+        Ok(t)
     }
 
     /// Returns the number of allowed actions for this environment.

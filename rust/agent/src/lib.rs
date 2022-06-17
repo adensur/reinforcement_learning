@@ -1,7 +1,7 @@
 use rand::Rng;
 use std::collections::vec_deque::VecDeque;
 use std::f64::consts;
-use tch::{kind, nn, nn::ModuleT, nn::OptimizerConfig, Device, Kind, Tensor};
+use tch::{kind, nn, nn::OptimizerConfig, Device, Kind, Tensor};
 
 #[cfg(test)]
 mod tests {
@@ -24,21 +24,21 @@ const MEMORY_CAPACITY: usize = 1_000;
 const BATCH_SIZE: usize = 128;
 
 #[derive(Debug)]
-pub struct Network {
+pub struct DenseNetwork {
     pub input_layer: nn::Linear,
     pub layers: Vec<nn::Linear>,
     pub final_layer: nn::Linear,
 }
 
-impl Network {
-    fn new(vs: &nn::Path, hidden_size: i64, hidden_layers: usize) -> Network {
+impl DenseNetwork {
+    fn new(vs: &nn::Path, hidden_size: i64, hidden_layers: usize) -> DenseNetwork {
         let input_layer = nn::linear(vs, INPUT_DIMS, hidden_size, Default::default());
         let mut layers: Vec<nn::Linear> = Vec::new();
         for _ in 0..hidden_layers {
             layers.push(nn::linear(vs, hidden_size, hidden_size, Default::default()));
         }
         let final_layer = nn::linear(vs, hidden_size, OUTPUT_DIMS, Default::default());
-        Network {
+        DenseNetwork {
             input_layer: input_layer,
             layers: layers,
             final_layer: final_layer,
@@ -46,13 +46,53 @@ impl Network {
     }
 }
 
-impl nn::ModuleT for Network {
+impl nn::ModuleT for DenseNetwork {
     fn forward_t(&self, xs: &Tensor, _train: bool) -> Tensor {
         let mut t = xs.apply(&self.input_layer).relu();
         for layer in &self.layers {
             t = t.apply(layer).relu();
         }
         t.apply(&self.final_layer)
+    }
+}
+
+#[derive(Debug)]
+pub struct ConvNetwork {
+    conv1: nn::Conv2D,
+    bn1: nn::BatchNorm,
+    conv2: nn::Conv2D,
+    bn2: nn::BatchNorm,
+    conv3: nn::Conv2D,
+    bn3: nn::BatchNorm,
+    final_layer: nn::Linear,
+}
+
+impl ConvNetwork {
+    fn new(vs: &nn::Path) -> ConvNetwork {
+        let mut conv_config = nn::ConvConfig::default();
+        conv_config.stride = 2;
+        ConvNetwork {
+            conv1: nn::conv2d(vs, 3, 16, 5, conv_config),
+            conv2: nn::conv2d(vs, 16, 32, 5, conv_config),
+            conv3: nn::conv2d(vs, 32, 32, 5, conv_config),
+            bn1: nn::batch_norm2d(vs, 16, Default::default()),
+            bn2: nn::batch_norm2d(vs, 32, Default::default()),
+            bn3: nn::batch_norm2d(vs, 32, Default::default()),
+            final_layer: nn::linear(vs, 108288, OUTPUT_DIMS, Default::default()),
+        }
+    }
+}
+
+impl nn::ModuleT for ConvNetwork {
+    fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor {
+        // xs is expected to be a flat tensor
+        let mut x = xs.view([-1, 3, 400, 600]);
+        x = self.bn1.forward_t(&x.apply(&self.conv1), train).relu();
+        x = self.bn2.forward_t(&x.apply(&self.conv2), train).relu();
+        x = self.bn3.forward_t(&x.apply(&self.conv3), train).relu();
+        x = x.flatten(1, 3); // flatten height, widths, channels; leave only batch dimension + 1 flat tensor
+        x = x.apply(&self.final_layer);
+        x
     }
 }
 
@@ -69,11 +109,12 @@ struct MemoryEvent {
 }
 
 pub struct SimpleAgent {
-    pub network: Network,
+    pub network: Box<dyn nn::ModuleT>,
     events_buf: Vec<Event>,
     optimizer: tch::nn::Optimizer,
     steps: i64,
     memory: VecDeque<MemoryEvent>,
+    input_dims: i64,
 }
 
 fn sdprint1(t: &Tensor) -> String {
@@ -88,15 +129,25 @@ fn sdprint1(t: &Tensor) -> String {
 }
 
 impl SimpleAgent {
-    pub fn new() -> Self {
+    pub fn new(network_type: &str) -> Self {
         let vs = nn::VarStore::new(Device::Cpu);
         let opt = nn::RmsProp::default().build(&vs, 1e-2).unwrap();
+        let network: Box<dyn nn::ModuleT> = match network_type {
+            "dense_net" => Box::new(DenseNetwork::new(&vs.root(), 32, 2)),
+            "conv_net" => Box::new(ConvNetwork::new(&vs.root())),
+            _ => panic!(""),
+        };
+        let mut input_dims = INPUT_DIMS;
+        if network_type == "conv_net" {
+            input_dims = 3 * 400 * 600;
+        }
         SimpleAgent {
-            network: Network::new(&vs.root(), 32, 2),
+            network: network,
             events_buf: Vec::new(),
             optimizer: opt,
             steps: 0,
             memory: VecDeque::with_capacity(MEMORY_CAPACITY),
+            input_dims: input_dims,
         }
     }
 
@@ -110,7 +161,7 @@ impl SimpleAgent {
             let action = rng.gen_range(0..=1);
             action
         } else {
-            let pred = self.network.forward_t(obs, false);
+            let pred = self.network.forward_t(&obs.unsqueeze(0), false).squeeze(); // obs is a single tensor, we should expect network to only work on batches
             pred.max_dim(0, false).1.int64_value(&[])
         }
     }
@@ -148,7 +199,8 @@ impl SimpleAgent {
             }
             // sample memory
             //self.optimizer.zero_grad();
-            let observations = Tensor::zeros(&[BATCH_SIZE as i64, INPUT_DIMS], kind::FLOAT_CPU);
+            let observations =
+                Tensor::zeros(&[BATCH_SIZE as i64, self.input_dims], kind::FLOAT_CPU);
             let mut actions: Vec<i64> = vec![0; BATCH_SIZE];
             let mut values: Vec<f64> = vec![0.0; BATCH_SIZE];
             let mut rng = rand::thread_rng();

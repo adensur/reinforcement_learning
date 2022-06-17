@@ -1,5 +1,5 @@
 [workspace]
 
 members = [
-    "gym", "gym_example", "agent", "s01_cartpole"
+    "gym", "gym_example", "agent", "s01_cartpole", "s02_cardpole_hard"
 ]

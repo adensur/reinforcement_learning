@@ -14,9 +14,10 @@ struct Opt {
 
 fn main() {
     let opt = Opt::from_args();
-    let mut agent = SimpleAgent::new("dense_net");
+    let mut agent = SimpleAgent::new("conv_net");
     let env = GymEnv::new("CartPole-v1").unwrap();
-    let mut obs = env.reset().unwrap();
+    let _ = env.reset().unwrap(); // only use images!
+    let mut img = env.render().unwrap().flatten(0, 2);
     //let action_space = env.action_space();
     if opt.report_freq > opt.epochs {
         panic!("!!!");
@@ -28,15 +29,16 @@ fn main() {
     for epoch in 0..opt.epochs {
         let mut i = 0;
         loop {
-            let action = agent.select_action(&obs);
+            let action = agent.select_action(&img);
             let step = env.step(action).unwrap();
             let is_done = step.is_done;
-            let loss = agent.consume_event(&obs, step.reward, action, step.is_done);
-            obs = step.obs;
+            let loss = agent.consume_event(&img, step.reward, action, step.is_done);
+            img = env.render().unwrap().flatten(0, 2);
             if is_done || i > 1_000_000 {
                 episodes.push(i);
                 losses.push(loss);
-                obs = env.reset().unwrap();
+                _ = env.reset().unwrap();
+                img = env.render().unwrap().flatten(0, 2);
                 if i >= 499 {
                     flag = true;
                 }
