@@ -13,14 +13,14 @@ struct Opt {
 }
 
 fn main() {
-    let opt = Opt::from_args();
+    let mut opt = Opt::from_args();
     let mut agent = SimpleAgent::new("conv_net");
     let env = GymEnv::new("CartPole-v1").unwrap();
     let _ = env.reset().unwrap(); // only use images!
     let mut img = env.render().unwrap().flatten(0, 2);
     //let action_space = env.action_space();
     if opt.report_freq > opt.epochs {
-        panic!("!!!");
+        opt.report_freq = opt.epochs;
     }
     let mut episodes: Vec<i64> = Vec::with_capacity(opt.epochs);
     let mut losses: Vec<f64> = Vec::with_capacity(opt.epochs);

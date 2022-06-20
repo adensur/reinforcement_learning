@@ -115,6 +115,7 @@ pub struct SimpleAgent {
     steps: i64,
     memory: VecDeque<MemoryEvent>,
     input_dims: i64,
+    device: Device,
 }
 
 fn sdprint1(t: &Tensor) -> String {
@@ -130,7 +131,9 @@ fn sdprint1(t: &Tensor) -> String {
 
 impl SimpleAgent {
     pub fn new(network_type: &str) -> Self {
-        let vs = nn::VarStore::new(Device::Cpu);
+        let device = Device::cuda_if_available();
+        println!("Detected device: {:?}", device);
+        let vs = nn::VarStore::new(device);
         let opt = nn::RmsProp::default().build(&vs, 1e-2).unwrap();
         let network: Box<dyn nn::ModuleT> = match network_type {
             "dense_net" => Box::new(DenseNetwork::new(&vs.root(), 32, 2)),
@@ -142,16 +145,18 @@ impl SimpleAgent {
             input_dims = 3 * 400 * 600;
         }
         SimpleAgent {
-            network: network,
+            network,
             events_buf: Vec::new(),
             optimizer: opt,
             steps: 0,
             memory: VecDeque::with_capacity(MEMORY_CAPACITY),
-            input_dims: input_dims,
+            input_dims,
+            device,
         }
     }
 
     pub fn select_action(&self, obs: &Tensor) -> i64 {
+        let obs = obs.to_device(self.device);
         let mut rng = rand::thread_rng();
         let rand: f64 = rng.gen_range(0.0..1.0);
         let explore_prob = EXPLORATION_END_PROB
@@ -199,8 +204,11 @@ impl SimpleAgent {
             }
             // sample memory
             //self.optimizer.zero_grad();
-            let observations =
-                Tensor::zeros(&[BATCH_SIZE as i64, self.input_dims], kind::FLOAT_CPU);
+            let float_kind = match self.device {
+                Device::Cpu => kind::FLOAT_CPU,
+                Device::Cuda(_) => kind::FLOAT_CUDA,
+            };
+            let observations = Tensor::zeros(&[BATCH_SIZE as i64, self.input_dims], float_kind);
             let mut actions: Vec<i64> = vec![0; BATCH_SIZE];
             let mut values: Vec<f64> = vec![0.0; BATCH_SIZE];
             let mut rng = rand::thread_rng();
@@ -213,8 +221,8 @@ impl SimpleAgent {
                 actions[i] = event.action;
                 values[i] = event.value;
             }
-            let actions_tensor = Tensor::of_slice(&actions);
-            let values_tensor = Tensor::of_slice(&values);
+            let actions_tensor = Tensor::of_slice(&actions).to_device(self.device);
+            let values_tensor = Tensor::of_slice(&values).to_device(self.device);
 
             let predictions = self.network.forward_t(&observations, /* train = */ true);
             let predicted_values = predictions
