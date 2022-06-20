@@ -1,7 +1,15 @@
-use agent::SimpleAgent;
+use agent::{Agent, PolicyGradientAgent, SimpleAgent};
 use gym::GymEnv;
 use std::time::Instant;
 use structopt::StructOpt;
+use strum::VariantNames;
+
+#[derive(Debug, strum::EnumString, strum::EnumVariantNames)]
+#[strum(serialize_all = "kebab-case")]
+enum Method {
+    Simple,
+    PolicyGradient,
+}
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "example", about = "An example of StructOpt usage.")]
@@ -10,11 +18,16 @@ struct Opt {
     epochs: usize,
     #[structopt(short = "r", long = "report-freq", default_value = "1000")]
     report_freq: usize,
+    #[structopt(short = "m", long = "method", default_value = "simple", possible_values = Method::VARIANTS)]
+    method: Method,
 }
 
 fn main() {
     let opt = Opt::from_args();
-    let mut agent = SimpleAgent::new("dense_net");
+    let mut agent: Box<dyn Agent> = match opt.method {
+        Method::Simple => Box::new(SimpleAgent::new("dense_net")),
+        Method::PolicyGradient => Box::new(PolicyGradientAgent::new("dense_net")),
+    };
     let env = GymEnv::new("CartPole-v1").unwrap();
     let mut obs = env.reset().unwrap();
     //let action_space = env.action_space();

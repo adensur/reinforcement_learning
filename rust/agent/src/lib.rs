@@ -108,6 +108,11 @@ struct MemoryEvent {
     action: i64,
 }
 
+pub trait Agent {
+    fn select_action(&self, obs: &Tensor) -> i64;
+    fn consume_event(&mut self, obs: &Tensor, reward: f64, action: i64, is_done: bool) -> f64; // returns loss on episode end
+}
+
 pub struct SimpleAgent {
     pub network: Box<dyn nn::ModuleT>,
     events_buf: Vec<Event>,
@@ -127,6 +132,29 @@ fn sdprint1(t: &Tensor) -> String {
         res.push_str(&format!("{}, ", t.double_value(&[i])));
     }
     res
+}
+
+fn calc_values(events: &Vec<Event>) -> Vec<f64> {
+    let mut cumreward: f64 = 0.0;
+    let mut values: Vec<f64> = vec![0.0; events.len()];
+    for i in (0..events.len()).rev() {
+        values[i] = events[i].reward + cumreward * GAMMA;
+        cumreward = cumreward * GAMMA + events[i].reward;
+    }
+    values
+}
+
+fn need_eps_greedy_exploration(steps: i64) -> bool {
+    let mut rng = rand::thread_rng();
+    let rand: f64 = rng.gen_range(0.0..1.0);
+    let explore_prob = EXPLORATION_END_PROB
+        + (EXPLORATION_START_PROB - EXPLORATION_END_PROB)
+            * (consts::E).powf(-1.0f64 * steps as f64 / EXPLORATION_PROB_DECAY_STEPS);
+    if rand <= explore_prob {
+        true
+    } else {
+        false
+    }
 }
 
 impl SimpleAgent {
@@ -154,15 +182,13 @@ impl SimpleAgent {
             device,
         }
     }
+}
 
-    pub fn select_action(&self, obs: &Tensor) -> i64 {
+impl Agent for SimpleAgent {
+    fn select_action(&self, obs: &Tensor) -> i64 {
         let obs = obs.to_device(self.device);
-        let mut rng = rand::thread_rng();
-        let rand: f64 = rng.gen_range(0.0..1.0);
-        let explore_prob = EXPLORATION_END_PROB
-            + (EXPLORATION_START_PROB - EXPLORATION_END_PROB)
-                * (consts::E).powf(-1.0f64 * self.steps as f64 / EXPLORATION_PROB_DECAY_STEPS);
-        if rand <= explore_prob {
+        if need_eps_greedy_exploration(self.steps) {
+            let mut rng = rand::thread_rng();
             let action = rng.gen_range(0..=1);
             action
         } else {
@@ -171,7 +197,7 @@ impl SimpleAgent {
         }
     }
 
-    pub fn consume_event(&mut self, obs: &Tensor, reward: f64, action: i64, is_done: bool) -> f64 {
+    fn consume_event(&mut self, obs: &Tensor, reward: f64, action: i64, is_done: bool) -> f64 {
         self.steps += 1;
         if !is_done {
             self.events_buf.push(Event {
@@ -182,12 +208,7 @@ impl SimpleAgent {
             0.0
         } else {
             // calc values - gamma cumulative reward
-            let mut cumreward: f64 = 0.0;
-            let mut values: Vec<f64> = vec![0.0; self.events_buf.len()];
-            for i in (0..self.events_buf.len()).rev() {
-                values[i] = self.events_buf[i].reward + cumreward * GAMMA;
-                cumreward = cumreward * GAMMA + self.events_buf[i].reward;
-            }
+            let values = calc_values(&self.events_buf);
             for i in 0..self.events_buf.len() {
                 if self.memory.len() > MEMORY_CAPACITY {
                     self.memory.pop_front();
@@ -232,6 +253,95 @@ impl SimpleAgent {
             let loss = (&diff * &diff).mean(Kind::Float);
             let loss_scalar = loss.double_value(&[]);
             self.optimizer.backward_step_clip(&loss, 1.0);
+            loss_scalar
+        }
+    }
+}
+
+pub struct PolicyGradientAgent {
+    pub network: Box<dyn nn::ModuleT>,
+    events_buf: Vec<Event>,
+    optimizer: tch::nn::Optimizer,
+    steps: i64,
+    input_dims: i64,
+    device: Device,
+}
+
+impl PolicyGradientAgent {
+    pub fn new(network_type: &str) -> Self {
+        let device = Device::cuda_if_available();
+        println!("Detected device: {:?}", device);
+        let vs = nn::VarStore::new(device);
+        let opt = nn::RmsProp::default().build(&vs, 1e-2).unwrap();
+        let network: Box<dyn nn::ModuleT> = match network_type {
+            "dense_net" => Box::new(DenseNetwork::new(&vs.root(), 32, 2)),
+            "conv_net" => Box::new(ConvNetwork::new(&vs.root())),
+            _ => panic!(""),
+        };
+        let mut input_dims = INPUT_DIMS;
+        if network_type == "conv_net" {
+            input_dims = 3 * 400 * 600;
+        }
+        PolicyGradientAgent {
+            network,
+            events_buf: Vec::new(),
+            optimizer: opt,
+            steps: 0,
+            input_dims,
+            device,
+        }
+    }
+}
+
+impl Agent for PolicyGradientAgent {
+    fn select_action(&self, obs: &Tensor) -> i64 {
+        let obs = obs.to_device(self.device);
+        if need_eps_greedy_exploration(self.steps) {
+            let mut rng = rand::thread_rng();
+            let action = rng.gen_range(0..=1);
+            action
+        } else {
+            let pred = self.network.forward_t(&obs.unsqueeze(0), false).squeeze(); // obs is a single tensor, we should expect network to only work on batches
+            pred.max_dim(0, false).1.int64_value(&[])
+        }
+    }
+
+    fn consume_event(&mut self, obs: &Tensor, reward: f64, action: i64, is_done: bool) -> f64 {
+        self.steps += 1;
+        if !is_done {
+            self.events_buf.push(Event {
+                observation: obs.copy(),
+                reward: reward,
+                action: action,
+            });
+            0.0
+        } else {
+            // calc values - gamma cumulative reward
+            let values = calc_values(&self.events_buf);
+            let values = Tensor::of_slice(&values).to_device(self.device);
+            // apply model
+            let observations: Vec<Tensor> = self
+                .events_buf
+                .iter()
+                .map(|s| s.observation.copy())
+                .collect();
+            let observations: Tensor = Tensor::stack(&observations, 0).to_device(self.device);
+            let logits = self.network.forward_t(&observations, /* train = */ true);
+            // get actions
+            let actions: Vec<i64> = self.events_buf.iter().map(|s| s.action).collect();
+            let actions = Tensor::of_slice(&actions).unsqueeze(1);
+            let action_mask =
+                Tensor::zeros(&[self.events_buf.len() as i64, 2], tch::kind::FLOAT_CPU)
+                    .scatter_value(1, &actions, 1.0);
+            let log_probs = (action_mask * logits.log_softmax(1, Kind::Float)).sum_dim_intlist(
+                &[1],
+                false,
+                Kind::Float,
+            );
+            let loss = -(values * log_probs).mean(Kind::Float);
+            self.optimizer.backward_step(&loss);
+            self.events_buf.clear();
+            let loss_scalar = loss.double_value(&[]);
             loss_scalar
         }
     }
