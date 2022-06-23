@@ -11,3 +11,4 @@ edition = "2021"
 rand = "0.8.5"
 structopt = { version = "0.3", default-features = false }
 strum = { version = "0.24", features = ["derive"] }
+tch = "0.7.2"

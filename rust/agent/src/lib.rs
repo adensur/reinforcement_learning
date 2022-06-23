@@ -12,8 +12,6 @@ mod tests {
     }
 }
 
-const INPUT_DIMS: i64 = 4;
-const OUTPUT_DIMS: i64 = 2;
 const GAMMA: f64 = 0.999;
 
 const EXPLORATION_START_PROB: f64 = 0.9;
@@ -31,13 +29,19 @@ pub struct DenseNetwork {
 }
 
 impl DenseNetwork {
-    fn new(vs: &nn::Path, hidden_size: i64, hidden_layers: usize) -> DenseNetwork {
-        let input_layer = nn::linear(vs, INPUT_DIMS, hidden_size, Default::default());
+    fn new(
+        vs: &nn::Path,
+        input_dims: i64,
+        output_dims: i64,
+        hidden_size: i64,
+        hidden_layers: usize,
+    ) -> DenseNetwork {
+        let input_layer = nn::linear(vs, input_dims, hidden_size, Default::default());
         let mut layers: Vec<nn::Linear> = Vec::new();
         for _ in 0..hidden_layers {
             layers.push(nn::linear(vs, hidden_size, hidden_size, Default::default()));
         }
-        let final_layer = nn::linear(vs, hidden_size, OUTPUT_DIMS, Default::default());
+        let final_layer = nn::linear(vs, hidden_size, output_dims, Default::default());
         DenseNetwork {
             input_layer: input_layer,
             layers: layers,
@@ -57,6 +61,36 @@ impl nn::ModuleT for DenseNetwork {
 }
 
 #[derive(Debug)]
+pub struct SoftmaxNetwork {
+    pub input_layer: nn::Linear,
+    pub final_layer: nn::Linear,
+}
+
+impl SoftmaxNetwork {
+    fn new(
+        vs: &nn::Path,
+        input_dims: i64,
+        output_dims: i64,
+        hidden_size: i64,
+        hidden_layers: usize,
+    ) -> SoftmaxNetwork {
+        let input_layer = nn::linear(vs, input_dims, hidden_size, Default::default());
+        let final_layer = nn::linear(vs, hidden_size, output_dims, Default::default());
+        SoftmaxNetwork {
+            input_layer: input_layer,
+            final_layer: final_layer,
+        }
+    }
+}
+
+impl nn::ModuleT for SoftmaxNetwork {
+    fn forward_t(&self, xs: &Tensor, _train: bool) -> Tensor {
+        let t = xs.apply(&self.input_layer).tanh();
+        t.apply(&self.final_layer)
+    }
+}
+
+#[derive(Debug)]
 pub struct ConvNetwork {
     conv1: nn::Conv2D,
     bn1: nn::BatchNorm,
@@ -68,7 +102,7 @@ pub struct ConvNetwork {
 }
 
 impl ConvNetwork {
-    fn new(vs: &nn::Path) -> ConvNetwork {
+    fn new(vs: &nn::Path, output_dims: i64) -> ConvNetwork {
         let mut conv_config = nn::ConvConfig::default();
         conv_config.stride = 2;
         ConvNetwork {
@@ -78,7 +112,7 @@ impl ConvNetwork {
             bn1: nn::batch_norm2d(vs, 16, Default::default()),
             bn2: nn::batch_norm2d(vs, 32, Default::default()),
             bn3: nn::batch_norm2d(vs, 32, Default::default()),
-            final_layer: nn::linear(vs, 108288, OUTPUT_DIMS, Default::default()),
+            final_layer: nn::linear(vs, 108288, output_dims, Default::default()),
         }
     }
 }
@@ -96,10 +130,51 @@ impl nn::ModuleT for ConvNetwork {
     }
 }
 
+#[derive(Debug)]
+pub struct ConvSoftmaxNetwork {
+    conv1: nn::Conv2D,
+    bn1: nn::BatchNorm,
+    conv2: nn::Conv2D,
+    bn2: nn::BatchNorm,
+    conv3: nn::Conv2D,
+    bn3: nn::BatchNorm,
+    final_layer: nn::Linear,
+}
+
+impl ConvSoftmaxNetwork {
+    fn new(vs: &nn::Path, output_dims: i64) -> ConvSoftmaxNetwork {
+        let mut conv_config = nn::ConvConfig::default();
+        conv_config.stride = 2;
+        ConvSoftmaxNetwork {
+            conv1: nn::conv2d(vs, 3, 16, 5, conv_config),
+            conv2: nn::conv2d(vs, 16, 32, 5, conv_config),
+            conv3: nn::conv2d(vs, 32, 32, 5, conv_config),
+            bn1: nn::batch_norm2d(vs, 16, Default::default()),
+            bn2: nn::batch_norm2d(vs, 32, Default::default()),
+            bn3: nn::batch_norm2d(vs, 32, Default::default()),
+            final_layer: nn::linear(vs, 108288, output_dims, Default::default()),
+        }
+    }
+}
+
+impl nn::ModuleT for ConvSoftmaxNetwork {
+    fn forward_t(&self, xs: &Tensor, train: bool) -> Tensor {
+        // xs is expected to be a flat tensor
+        let mut x = xs.view([-1, 3, 400, 600]);
+        x = self.bn1.forward_t(&x.apply(&self.conv1), train).tanh();
+        x = self.bn2.forward_t(&x.apply(&self.conv2), train).tanh();
+        x = self.bn3.forward_t(&x.apply(&self.conv3), train).tanh();
+        x = x.flatten(1, 3); // flatten height, widths, channels; leave only batch dimension + 1 flat tensor
+        x = x.apply(&self.final_layer);
+        x
+    }
+}
+
 struct Event {
     observation: Tensor,
     reward: f64,
     action: i64,
+    is_done: bool,
 }
 
 struct MemoryEvent {
@@ -111,6 +186,7 @@ struct MemoryEvent {
 pub trait Agent {
     fn select_action(&self, obs: &Tensor) -> i64;
     fn consume_event(&mut self, obs: &Tensor, reward: f64, action: i64, is_done: bool) -> f64; // returns loss on episode end
+    fn forward(&self, obs: &Tensor) -> Tensor;
 }
 
 pub struct SimpleAgent {
@@ -120,24 +196,17 @@ pub struct SimpleAgent {
     steps: i64,
     memory: VecDeque<MemoryEvent>,
     input_dims: i64,
+    output_dims: i64,
     device: Device,
-}
-
-fn sdprint1(t: &Tensor) -> String {
-    if t.dim() != 1 {
-        panic!("Expected tensor of rank 1!");
-    }
-    let mut res = String::new();
-    for i in 0..t.size1().unwrap() {
-        res.push_str(&format!("{}, ", t.double_value(&[i])));
-    }
-    res
 }
 
 fn calc_values(events: &Vec<Event>) -> Vec<f64> {
     let mut cumreward: f64 = 0.0;
     let mut values: Vec<f64> = vec![0.0; events.len()];
     for i in (0..events.len()).rev() {
+        if events[i].is_done {
+            cumreward = 0.0;
+        }
         values[i] = events[i].reward + cumreward * GAMMA;
         cumreward = cumreward * GAMMA + events[i].reward;
     }
@@ -158,17 +227,23 @@ fn need_eps_greedy_exploration(steps: i64) -> bool {
 }
 
 impl SimpleAgent {
-    pub fn new(network_type: &str) -> Self {
+    pub fn new(network_type: &str, input_dims: i64, output_dims: i64) -> Self {
         let device = Device::cuda_if_available();
         println!("Detected device: {:?}", device);
         let vs = nn::VarStore::new(device);
         let opt = nn::RmsProp::default().build(&vs, 1e-2).unwrap();
         let network: Box<dyn nn::ModuleT> = match network_type {
-            "dense_net" => Box::new(DenseNetwork::new(&vs.root(), 32, 2)),
-            "conv_net" => Box::new(ConvNetwork::new(&vs.root())),
+            "dense_net" => Box::new(DenseNetwork::new(
+                &vs.root(),
+                input_dims,
+                output_dims,
+                32,
+                2,
+            )),
+            "conv_net" => Box::new(ConvNetwork::new(&vs.root(), output_dims)),
             _ => panic!(""),
         };
-        let mut input_dims = INPUT_DIMS;
+        let mut input_dims = input_dims;
         if network_type == "conv_net" {
             input_dims = 3 * 400 * 600;
         }
@@ -179,17 +254,22 @@ impl SimpleAgent {
             steps: 0,
             memory: VecDeque::with_capacity(MEMORY_CAPACITY),
             input_dims,
+            output_dims,
             device,
         }
     }
 }
 
 impl Agent for SimpleAgent {
+    fn forward(&self, obs: &Tensor) -> Tensor {
+        self.network.forward_t(&obs.unsqueeze(0), false).squeeze()
+    }
+
     fn select_action(&self, obs: &Tensor) -> i64 {
         let obs = obs.to_device(self.device);
         if need_eps_greedy_exploration(self.steps) {
             let mut rng = rand::thread_rng();
-            let action = rng.gen_range(0..=1);
+            let action = rng.gen_range(0..self.output_dims);
             action
         } else {
             let pred = self.network.forward_t(&obs.unsqueeze(0), false).squeeze(); // obs is a single tensor, we should expect network to only work on batches
@@ -204,6 +284,7 @@ impl Agent for SimpleAgent {
                 observation: obs.copy(),
                 reward: reward,
                 action: action,
+                is_done,
             });
             0.0
         } else {
@@ -268,17 +349,23 @@ pub struct PolicyGradientAgent {
 }
 
 impl PolicyGradientAgent {
-    pub fn new(network_type: &str) -> Self {
+    pub fn new(network_type: &str, input_dims: i64, output_dims: i64) -> Self {
         let device = Device::cuda_if_available();
         println!("Detected device: {:?}", device);
         let vs = nn::VarStore::new(device);
         let opt = nn::RmsProp::default().build(&vs, 1e-2).unwrap();
         let network: Box<dyn nn::ModuleT> = match network_type {
-            "dense_net" => Box::new(DenseNetwork::new(&vs.root(), 32, 2)),
-            "conv_net" => Box::new(ConvNetwork::new(&vs.root())),
+            "dense_net" => Box::new(SoftmaxNetwork::new(
+                &vs.root(),
+                input_dims,
+                output_dims,
+                32,
+                2,
+            )),
+            "conv_net" => Box::new(ConvSoftmaxNetwork::new(&vs.root(), output_dims)),
             _ => panic!(""),
         };
-        let mut input_dims = INPUT_DIMS;
+        let mut input_dims = input_dims;
         if network_type == "conv_net" {
             input_dims = 3 * 400 * 600;
         }
@@ -302,17 +389,24 @@ impl Agent for PolicyGradientAgent {
             action
         } else {
             let pred = self.network.forward_t(&obs.unsqueeze(0), false).squeeze(); // obs is a single tensor, we should expect network to only work on batches
-            pred.max_dim(0, false).1.int64_value(&[])
+            let action = pred.softmax(0, Kind::Float).multinomial(1, true);
+            let action = i64::from(action);
+            action
         }
+    }
+
+    fn forward(&self, obs: &Tensor) -> Tensor {
+        self.network.forward_t(&obs.unsqueeze(0), false).squeeze()
     }
 
     fn consume_event(&mut self, obs: &Tensor, reward: f64, action: i64, is_done: bool) -> f64 {
         self.steps += 1;
-        if !is_done {
+        if !is_done || self.events_buf.len() > 5000 {
             self.events_buf.push(Event {
                 observation: obs.copy(),
                 reward: reward,
                 action: action,
+                is_done,
             });
             0.0
         } else {

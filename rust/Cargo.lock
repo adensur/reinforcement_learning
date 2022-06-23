@@ -449,6 +449,7 @@ dependencies = [
  "rand",
  "structopt",
  "strum",
+ "tch",
 ]
 
 [[package]]
@@ -459,6 +460,19 @@ dependencies = [
  "gym",
  "rand",
  "structopt",
+ "strum",
+]
+
+[[package]]
+name = "s03_lunar"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "gym",
+ "rand",
+ "structopt",
+ "strum",
+ "tch",
 ]
 
 [[package]]
