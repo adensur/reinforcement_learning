@@ -17,6 +17,8 @@ enum Method {
 struct Opt {
     #[structopt(short = "e", long = "epochs", default_value = "100000")]
     epochs: usize,
+    #[structopt(short = "v", long = "validate-epochs", default_value = "100")]
+    validate_epochs: usize,
     #[structopt(short = "r", long = "report-freq", default_value = "1000")]
     report_freq: usize,
     #[structopt(short = "m", long = "method", default_value = "simple", possible_values = Method::VARIANTS)]
@@ -57,7 +59,6 @@ fn main() {
     let mut flag = false;
     let start = Instant::now();
     let mut total_reward = 0.0;
-    let mut wins_count = 0;
     for epoch in 0..opt.epochs {
         let mut i = 0;
         loop {
@@ -72,15 +73,6 @@ fn main() {
                 losses.push(loss);
                 total_rewards.push(total_reward);
                 obs = env.reset().unwrap();
-                if total_reward >= 200.0 {
-                    wins_count += 1;
-                    println!("We won!!!! Wins in a row: {}", wins_count);
-                    if wins_count >= 10 {
-                        flag = true;
-                    }
-                } else {
-                    wins_count = 0;
-                }
                 total_reward = 0.0;
                 break;
             }
@@ -109,7 +101,29 @@ fn main() {
             println!(
                 "Epoch {}, last {} epochs avg episode len {}, max_len {}, avg total reward {}, max total reward {}, avg loss {}",
                 epoch, opt.report_freq, avg_len, max_len, avg_total_reward, max_total_reward, avg_loss
-            )
+            );
+            let mut wins_count = 0;
+            for _validate_epoch in 0..opt.validate_epochs {
+                let mut total_reward = 0.0;
+                loop {
+                    let action = agent.select_action(&obs);
+                    let step = env.step(action).unwrap();
+                    total_reward += step.reward;
+                    let is_done = step.is_done;
+                    if is_done {
+                        obs = env.reset().unwrap();
+                        if total_reward >= 200.0 {
+                            wins_count += 1;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            println!(
+                "Validation results: won {} games out of {}",
+                wins_count, opt.validate_epochs
+            );
         }
         if flag {
             break;

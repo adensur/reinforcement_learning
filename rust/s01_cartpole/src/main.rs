@@ -1,15 +1,17 @@
-use agent::{Agent, PolicyGradientAgent, SimpleAgent};
+use agent::{Agent, DQNAgent, NaiveAgent, PolicyGradientAgent, SimpleAgent};
 use gym::GymEnv;
 use std::time::Instant;
 use structopt::StructOpt;
 use strum::VariantNames;
-use tch::{kind, nn, nn::OptimizerConfig, Device, Kind, Tensor};
+use tch::Kind;
 
 #[derive(Debug, strum::EnumString, strum::EnumVariantNames)]
 #[strum(serialize_all = "kebab-case")]
 enum Method {
     Simple,
     PolicyGradient,
+    DQN,
+    Naive,
 }
 
 #[derive(Debug, StructOpt)]
@@ -19,8 +21,20 @@ struct Opt {
     epochs: usize,
     #[structopt(short = "v", long = "validate-epochs", default_value = "100")]
     validate_epochs: usize,
+    #[structopt(short = "c", long = "memory-capacity", default_value = "1000")]
+    memory_capacity: usize,
     #[structopt(short = "r", long = "report-freq", default_value = "1000")]
     report_freq: usize,
+    #[structopt(short = "r", long = "target-update-freq", default_value = "10")]
+    target_update_freq: i64,
+    #[structopt(short = "b", long = "batch-size", default_value = "5000")]
+    batch_size: usize,
+    #[structopt(
+        short = "r",
+        long = "exploration-prob-decay-steps",
+        default_value = "100000"
+    )]
+    exploration_prob_decay_steps: i64,
     #[structopt(short = "m", long = "method", default_value = "simple", possible_values = Method::VARIANTS)]
     method: Method,
 }
@@ -31,11 +45,32 @@ fn main() {
     let input_dims = env.observation_space()[0];
     let output_dims = env.action_space();
     let mut agent: Box<dyn Agent> = match opt.method {
-        Method::Simple => Box::new(SimpleAgent::new("dense_net", input_dims, output_dims)),
+        Method::Simple => Box::new(SimpleAgent::new(
+            "dense_net",
+            input_dims,
+            output_dims,
+            opt.memory_capacity,
+            opt.exploration_prob_decay_steps,
+        )),
         Method::PolicyGradient => Box::new(PolicyGradientAgent::new(
             "dense_net",
             input_dims,
             output_dims,
+            opt.exploration_prob_decay_steps,
+        )),
+        Method::DQN => Box::new(DQNAgent::new(
+            input_dims,
+            output_dims,
+            opt.memory_capacity,
+            opt.target_update_freq,
+            opt.exploration_prob_decay_steps,
+        )),
+        Method::Naive => Box::new(NaiveAgent::new(
+            "dense_net",
+            input_dims,
+            output_dims,
+            opt.batch_size,
+            opt.exploration_prob_decay_steps,
         )),
     };
     let mut obs = env.reset().unwrap();
@@ -58,7 +93,11 @@ fn main() {
             let action = agent.select_action(&obs);
             let step = env.step(action).unwrap();
             let is_done = step.is_done;
-            let loss = agent.consume_event(&obs, step.reward, action, step.is_done);
+            let next_obs = match step.is_done {
+                true => None,
+                false => Some(&step.obs),
+            };
+            let loss = agent.consume_event(&obs, next_obs, step.reward, action, step.is_done);
             obs = step.obs;
             if is_done || i > 1_000_000 {
                 episodes.push(i);
@@ -85,28 +124,38 @@ fn main() {
                 epoch, opt.report_freq, avg_len, max_len, avg_loss
             );
             // do some validate measurements
-            let mut wins_count = 0;
-            for _validate_epoch in 0..opt.validate_epochs {
-                let mut validate_episodes: Vec<i64> = Vec::with_capacity(opt.epochs);
-                loop {
-                    let action = agent.select_action(&obs);
-                    let step = env.step(action).unwrap();
-                    let is_done = step.is_done;
-                    if is_done || i > 1_000_000 {
-                        validate_episodes.push(i);
-                        obs = env.reset().unwrap();
-                        if i >= 499 {
-                            wins_count += 1;
+            {
+                let mut obs = env.reset().unwrap();
+                let mut wins_count = 0;
+                let mut episodes: Vec<i64> = Vec::with_capacity(opt.epochs);
+                for _validate_epoch in 0..opt.validate_epochs {
+                    i = 0;
+                    loop {
+                        let action = agent.select_action(&obs);
+                        let step = env.step(action).unwrap();
+                        obs = step.obs;
+                        let is_done = step.is_done;
+                        if is_done {
+                            episodes.push(i);
+                            obs = env.reset().unwrap();
+                            if i >= 499 {
+                                wins_count += 1;
+                            }
+                            break;
                         }
-                        break;
+                        i += 1;
                     }
-                    i += 1;
+                }
+                let avg_len = episodes.iter().sum::<i64>() as f64 / episodes.len() as f64;
+                let max_len = *episodes.iter().max().unwrap();
+                println!(
+                    "Validation results: won {} games out of {}, avg len {}, max len {}",
+                    wins_count, opt.validate_epochs, avg_len, max_len,
+                );
+                if wins_count == opt.validate_epochs {
+                    flag = true;
                 }
             }
-            println!(
-                "Validation results: won {} games out of {}",
-                wins_count, opt.validate_epochs
-            )
         }
         if flag {
             break;
